@@ -62,9 +62,15 @@ class ACCSharedMemory:
 # SESSÃO
 # ==========================
 
+import os
+
+# Criar pastas se não existirem
+os.makedirs("dados", exist_ok=True)
+os.makedirs("relatorios", exist_ok=True)
+
 SESSION_NAME = datetime.now().strftime("%Y%m%d_%H%M%S")
-CSV_FILE = f"telemetry_{SESSION_NAME}.csv"
-PDF_FILE = f"telemetry_{SESSION_NAME}.pdf"
+CSV_FILE = os.path.join("dados", f"telemetry_{SESSION_NAME}.csv")
+PDF_FILE = os.path.join("relatorios", f"telemetry_{SESSION_NAME}.pdf")
 
 def init_csv():
     with open(CSV_FILE, "w", newline="") as f:
