@@ -132,13 +132,28 @@ class InstaladorCorredorX:
             command=self.iniciar_instalacao,
             bg="#00aa00",
             fg="white",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             relief=tk.FLAT,
             cursor="hand2",
             height=2,
             activebackground="#00ff00"
         )
-        self.install_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.install_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        
+        self.run_button = tk.Button(
+            button_frame,
+            text="▶️ EXECUTAR",
+            command=self.executar_programa,
+            bg="#0066cc",
+            fg="white",
+            font=("Segoe UI", 11, "bold"),
+            relief=tk.FLAT,
+            cursor="hand2",
+            height=2,
+            state=tk.DISABLED,
+            activebackground="#0088ff"
+        )
+        self.run_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 3))
         
         self.close_button = tk.Button(
             button_frame,
@@ -146,13 +161,13 @@ class InstaladorCorredorX:
             command=self.root.quit,
             bg="#aa0000",
             fg="white",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             relief=tk.FLAT,
             cursor="hand2",
             height=2,
             activebackground="#ff0000"
         )
-        self.close_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        self.close_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
         
     def log(self, mensagem):
         self.log_text.insert(tk.END, mensagem + "\n")
@@ -184,8 +199,34 @@ class InstaladorCorredorX:
             self.log(f"❌ EXCEÇÃO: {str(e)}")
             return False
     
+    def executar_programa(self):
+        """Executa o programa Corredor X após instalação"""
+        self.log("\n" + "=" * 60)
+        self.log("▶️ INICIANDO CORREDOR X...")
+        self.log("=" * 60)
+        
+        try:
+            if os.path.exists("executar.bat"):
+                subprocess.Popen(["executar.bat"], shell=True)
+                self.log("✅ Programa iniciado!")
+                self.log("⚠️ Certifique-se de que o ACC está rodando")
+            else:
+                # Executar diretamente
+                if os.path.exists("venv"):
+                    python_path = os.path.join("venv", "Scripts", "python.exe")
+                else:
+                    python_path = sys.executable
+                
+                subprocess.Popen([python_path, "corredorx.py"])
+                self.log("✅ Programa iniciado!")
+                self.log("⚠️ Certifique-se de que o ACC está rodando")
+        except Exception as e:
+            self.log(f"❌ Erro ao executar: {e}")
+            messagebox.showerror("Erro", f"Não foi possível executar o programa:\n{e}")
+    
     def instalar(self):
         self.install_button.config(state=tk.DISABLED)
+        self.run_button.config(state=tk.DISABLED)
         self.close_button.config(state=tk.DISABLED)
         self.progress.start()
         
@@ -259,16 +300,16 @@ class InstaladorCorredorX:
             self.log("🎉 INSTALAÇÃO CONCLUÍDA COM SUCESSO!")
             self.log("=" * 60)
             self.log("")
-            self.log("▶️ Para executar:")
-            if self.use_venv.get():
-                self.log("   executar.bat")
-            else:
-                self.log(f"   {sys.executable} corredorx.py")
+            self.log("▶️ Clique em 'EXECUTAR' para iniciar o programa")
+            self.log("   ou feche e use: executar.bat")
+            
+            # Habilitar botão EXECUTAR
+            self.run_button.config(state=tk.NORMAL, bg="#00aa00")
             
             messagebox.showinfo(
                 "Instalação Concluída",
                 "✅ Corredor X instalado com sucesso!\n\n"
-                "Execute 'executar.bat' para iniciar."
+                "Clique em 'EXECUTAR' para iniciar!"
             )
         else:
             self.log("❌ INSTALAÇÃO FALHOU")
