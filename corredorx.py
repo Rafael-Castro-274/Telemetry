@@ -1,475 +1,431 @@
-#só podemos mudar nosssos caminhos, quando mudamos nossas decisões"
-"""
-Projeto Corredor X - Telemetria ACC
-Versão 2.0 com Offsets Oficiais
-
-Realtime:
-- Acelerador & Freio (gráfico ao vivo)
-
-Captura (28 campos):
-- Voltas: número, tempo, melhor tempo, delta, posição
-- Inputs: gas, brake, steer, gear
-- Motor: RPM, combustível
-- Pneus: pressão [4], temperatura [4]
-- Assistências: TC, ABS
-- Condições: temperatura ar/pista, chuva
-- Bandeiras: None/Blue/Yellow/Checkered/etc
-- Status: in_pit
-
-Export:
-- CSV completo (dados/)
-- PDF com 11 gráficos (relatorios/)
-  * Tempos de volta
-  * RPM, marcha, volante
-  * Acelerador, freio, velocidade
-  * Combustível
-  * Temperaturas ar/pista
-  * Pressão dos pneus (4 rodas)
-  * Temperatura dos pneus (4 rodas)
-"""
-
-# ==========================
-# IMPORTS
-# ==========================
-
-import mmap
-import struct
+import tkinter as tk
+from tkinter import messagebox
+import ctypes
+import threading
 import time
-import csv
-import os
-import numpy as np
-from collections import deque
-from datetime import datetime
+from dataclasses import dataclass
 
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-
-# ==========================
-# SHARED MEMORY NAMES
-# ==========================
-
-SHM_PHYSICS  = "Local\\acpmf_physics"
-SHM_GRAPHICS = "Local\\acpmf_graphics"
-SHM_STATIC   = "Local\\acpmf_static"
-
-SHM_SIZE = 4096
-
-# ==========================
-# OFFSETS (ACC)
-# Baseado em: ACCSharedMemory.h oficial
-# ==========================
-
-PHYSICS = {
-    "packet_id": 0,
-    "gas": 4,
-    "brake": 8,
-    "fuel": 12,
-    "gear": 16,
-    "rpm": 20,
-    "steer": 24,
-    "speed": 28,
-    # Arrays de pneus [FL, FR, RL, RR]
-    "wheel_slip": 32,        # float[4]
-    "tyre_pressure": 48,     # float[4]
-    "tyre_core_temp": 80,    # float[4]
-    # Assistências (int: 0/1)
-    "tc": 112,
-    "abs": 116,
-    "pit_limiter": 120,
+# ======================================================
+# 1. CONFIGURAÇÕES E CONSTANTES
+# ======================================================
+GEAR_MAP = {
+    0: "R", 1: "N", 2: "1", 3: "2", 4: "3", 
+    5: "4", 6: "5", 7: "6", 8: "7", 9: "8"
 }
+FILE_MAP_READ = 0x0004
+MAX_RPM_GT3 = 9000  # Referência para a barra de RPM
 
-GRAPHICS = {
-    "packet_id": 0,
-    "status": 4,              # 0=OFF, 1=REPLAY, 2=LIVE
-    "session": 8,             # 0=Practice, 1=Qualify, 2=Race
-    "completed_laps": 268,
-    "position": 272,
-    "i_current_time": 276,    # ms
-    "i_last_time": 280,       # ms
-    "i_best_time": 284,       # ms
-    "session_time_left": 288, # float ms
-    "distance_traveled": 292, # float meters
-    "is_in_pit": 296,
-    "current_sector": 300,
-    "last_sector_time": 304,
-    "number_of_laps": 308,
-    "flag": 1356,             # 0=None, 1=Blue, 2=Yellow, 5=Checkered
-    # Condições climáticas (SIM, estão no Graphics!)
-    "air_temp": 1384,         # float °C
-    "road_temp": 1388,        # float °C
-    "rain_intensity": 1392,   # float 0-1
-}
+# ======================================================
+# 2. ESTRUTURAS DE MEMÓRIA (C++ / ACC)
+# ======================================================
+class SPageFilePhysics(ctypes.Structure):
+    _pack_ = 4
+    _fields_ = [
+        ("packetId", ctypes.c_int),
+        ("gas", ctypes.c_float),
+        ("brake", ctypes.c_float),
+        ("fuel", ctypes.c_float),
+        ("gear", ctypes.c_int),
+        ("rpm", ctypes.c_int),
+        ("steerAngle", ctypes.c_float),
+        ("speedKmh", ctypes.c_float),
+        ("velocity", ctypes.c_float * 3),
+        ("accG", ctypes.c_float * 3),
+        ("wheelSlip", ctypes.c_float * 4),
+        ("wheelLoad", ctypes.c_float * 4),
+        ("wheelPressure", ctypes.c_float * 4), # <-- Pressão aqui
+        ("wheelAngularSpeed", ctypes.c_float * 4),
+        ("tyreWear", ctypes.c_float * 4),
+        ("tyreDirtyLevel", ctypes.c_float * 4),
+        ("tyreCoreTemp", ctypes.c_float * 4),
+        ("camberRAD", ctypes.c_float * 4),
+        ("suspensionTravel", ctypes.c_float * 4),
+        ("drs", ctypes.c_float),
+        ("tc", ctypes.c_float),
+        ("heading", ctypes.c_float),
+        ("pitch", ctypes.c_float),
+        ("roll", ctypes.c_float),
+        ("cgHeight", ctypes.c_float),
+        ("carDamage", ctypes.c_float * 5),
+        ("numberOfTyresOut", ctypes.c_int),
+        ("pitLimiterOn", ctypes.c_int),
+        ("abs", ctypes.c_float),
+        ("kersCharge", ctypes.c_float),
+        ("kersInput", ctypes.c_float),
+        ("isStationary", ctypes.c_int),
+        ("suspensionTravelNormalized", ctypes.c_float * 4),
+        ("waterTemp", ctypes.c_float),
+        ("oilTemp", ctypes.c_float),
+        ("fuelInTank", ctypes.c_float),
+        ("tyreTemp", ctypes.c_float * 4),
+        ("padLife", ctypes.c_float * 4),
+        ("discLife", ctypes.c_float * 4),
+        ("ignitionOn", ctypes.c_int),
+        ("starterEngineOn", ctypes.c_int),
+        ("isEngineRunning", ctypes.c_int),
+        ("kerbVibration", ctypes.c_float),
+        ("slipVibrations", ctypes.c_float),
+        ("gVibrations", ctypes.c_float),
+        ("absVibrations", ctypes.c_float),
+        ("kerbShift", ctypes.c_float), 
+        ("gap1", ctypes.c_byte * 4), 
+        ("brakeBias", ctypes.c_float),
+    ]
 
-STATIC = {
-    "car_model": 68,      # wchar[33]
-    "track": 134,         # wchar[33]
-    "player_name": 200,   # wchar[33]
-    "player_surname": 266,# wchar[33]
-    "max_rpm": 410,       # int
-    "max_fuel": 414,      # float
-}
+class Graphics(ctypes.Structure):
+    _pack_ = 4
+    _fields_ = [
+        ("packetId", ctypes.c_int),
+        ("status", ctypes.c_int),
+        ("session", ctypes.c_int),
+        ("currentTime", ctypes.c_wchar * 15),
+        ("lastTime", ctypes.c_wchar * 15),
+        ("bestTime", ctypes.c_wchar * 15),
+        ("split", ctypes.c_wchar * 15),
+        ("completedLaps", ctypes.c_int),
+        ("position", ctypes.c_int),
+        ("iCurrentTime", ctypes.c_int),
+        ("iLastTime", ctypes.c_int),
+        ("iBestTime", ctypes.c_int),
+        ("sessionTimeLeft", ctypes.c_float),
+        ("distanceTraveled", ctypes.c_float),
+        ("isInPit", ctypes.c_int),
+        ("currentSectorIndex", ctypes.c_int),
+        ("lastSectorTime", ctypes.c_int),
+        ("numberOfLaps", ctypes.c_int),
+        ("tyreCompound", ctypes.c_wchar * 33),
+        ("replayTimeMultiplier", ctypes.c_float),
+        ("normalizedCarPosition", ctypes.c_float),
+        ("activeCars", ctypes.c_int),
+        ("carCoordinates", (ctypes.c_float * 3) * 60),
+        ("carID", ctypes.c_int * 60),
+        ("playerCarID", ctypes.c_int),
+        ("penaltyTime", ctypes.c_float),
+        ("flag", ctypes.c_int),
+        ("penalty", ctypes.c_int),
+        ("idealLineOn", ctypes.c_int),
+        ("isInPitLane", ctypes.c_int),
+        ("surfaceGrip", ctypes.c_float),
+        ("mandatoryPitDone", ctypes.c_int),
+        ("windSpeed", ctypes.c_float),
+        ("windDirection", ctypes.c_float),
+        ("isSetupMenuVisible", ctypes.c_int),
+        ("mainDisplayIndex", ctypes.c_int),
+        ("secondaryDisplayIndex", ctypes.c_int),
+        ("TC", ctypes.c_int),
+        ("TCCut", ctypes.c_int),
+        ("EngineMap", ctypes.c_int), 
+        ("ABS", ctypes.c_int),
+    ]
 
-# ==========================
-# SHARED MEMORY HANDLER
-# ==========================
-
-class ACCSharedMemory:
-    def __init__(self, name):
-        try:
-            self.mm = mmap.mmap(-1, SHM_SIZE, tagname=name, access=mmap.ACCESS_READ)
-        except Exception as e:
-            raise RuntimeError(
-                f"Não foi possível acessar {name}.\n"
-                f"Verifique se o ACC está aberto e em pista.\n"
-                f"Erro: {e}"
-            )
-
-    def read_float(self, offset):
-        self.mm.seek(offset)
-        return struct.unpack("f", self.mm.read(4))[0]
-
-    def read_int(self, offset):
-        self.mm.seek(offset)
-        return struct.unpack("i", self.mm.read(4))[0]
-
-    def read_wstring(self, offset, size=33):
-        self.mm.seek(offset)
-        raw = self.mm.read(size * 2)
-        return raw.decode("utf-16", errors='ignore').split("\x00")[0]
+# ======================================================
+# 3. ESTADO DA TELEMETRIA
+# ======================================================
+@dataclass
+class TelemetryData:
+    status: str = "Aguardando ACC..."
+    gear: str = "N"
+    speed: int = 0
+    rpm: int = 0
+    gas: float = 0.0
+    brake: float = 0.0
+    fuel: float = 0.0
+    brake_bias: float = 0.0
     
-    def read_float_array(self, offset, count=4):
-        """Lê array de floats (ex: pneus)"""
-        self.mm.seek(offset)
-        return struct.unpack(f"{count}f", self.mm.read(4 * count))
-
-# ==========================
-# SESSION FILES
-# ==========================
-
-# Criar pastas se não existirem
-os.makedirs("dados", exist_ok=True)
-os.makedirs("relatorios", exist_ok=True)
-
-SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-CSV_FILE = os.path.join("dados", f"telemetry_{SESSION_ID}.csv")
-PDF_FILE = os.path.join("relatorios", f"telemetry_{SESSION_ID}.pdf")
-
-def init_csv():
-    with open(CSV_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "time",
-            "lap",
-            "position",
-            "lap_time",
-            "best_time",
-            "delta",
-            "gas",
-            "brake",
-            "rpm",
-            "speed",
-            "gear",
-            "steer",
-            "fuel",
-            "tc_on",
-            "abs_on",
-            "tyre_press_fl",
-            "tyre_press_fr",
-            "tyre_press_rl",
-            "tyre_press_rr",
-            "tyre_temp_fl",
-            "tyre_temp_fr",
-            "tyre_temp_rl",
-            "tyre_temp_rr",
-            "air_temp",
-            "road_temp",
-            "rain",
-            "flag",
-            "in_pit",
-        ])
-
-def save_row(row):
-    with open(CSV_FILE, "a", newline="") as f:
-        csv.writer(f).writerow(row)
-
-# ==========================
-# REALTIME PLOT
-# ==========================
-
-plt.ion()
-fig, ax = plt.subplots(figsize=(6, 3))
-fig.canvas.manager.set_window_title("Corredor X | Realtime")
-
-fig.patch.set_facecolor("black")
-ax.set_facecolor("black")
-
-ax.set_ylim(0, 1.05)
-ax.set_xlim(0, 300)
-ax.set_title("Acelerador & Freio", color="white")
-
-line_gas, = ax.plot([], [], color="red", linewidth=2, label="Acelerador")
-line_brake, = ax.plot([], [], color="lime", linewidth=2, label="Freio")
-
-ax.tick_params(colors="white")
-for spine in ax.spines.values():
-    spine.set_color("white")
-
-ax.legend(facecolor="black", edgecolor="white", labelcolor="white")
-plt.tight_layout()
-plt.show(block=False)
-
-gas_buf = deque(maxlen=300)
-brake_buf = deque(maxlen=300)
-
-
-# ==========================
-# MAIN LOOP
-# ==========================
-
-def main():
-    print("🚗 Corredor X | Telemetria ativa")
-    print("📊 Conectando às Shared Memories do ACC...")
+    # Eletrônica
+    tc1: int = 0
+    tc2: int = 0
+    abs_val: int = 0
+    engine_map: int = 0
     
-    try:
-        physics  = ACCSharedMemory(SHM_PHYSICS)
-        graphics = ACCSharedMemory(SHM_GRAPHICS)
-        static   = ACCSharedMemory(SHM_STATIC)
-    except RuntimeError as e:
-        print(f"\n❌ Erro: {e}")
-        return
+    # Pneus
+    tyre_core_temp: list = None 
+    tyre_pressure: list = None # Adicionado lista de pressões
+    connected: bool = False
 
-    init_csv()
-
-    start_time = time.time()
-    last_lap = 0
-
-    print("✅ Conectado! Capturando telemetria...")
-    print()
-
-    try:
-        while True:
-            t = round(time.time() - start_time, 3)
-
-            # Physics data
-            gas = physics.read_float(PHYSICS["gas"])
-            brake = physics.read_float(PHYSICS["brake"])
-            fuel = physics.read_float(PHYSICS["fuel"])
-            rpm = physics.read_int(PHYSICS["rpm"])
-            speed = physics.read_float(PHYSICS["speed"])
-            gear = physics.read_int(PHYSICS["gear"])
-            steer = physics.read_float(PHYSICS["steer"])
-            tc_on = physics.read_int(PHYSICS["tc"])
-            abs_on = physics.read_int(PHYSICS["abs"])
-            
-            # Arrays de pneus
-            tyre_press = physics.read_float_array(PHYSICS["tyre_pressure"], 4)
-            tyre_temp = physics.read_float_array(PHYSICS["tyre_core_temp"], 4)
-
-            # Graphics data
-            lap = graphics.read_int(GRAPHICS["completed_laps"])
-            position = graphics.read_int(GRAPHICS["position"])
-            i_last_time = graphics.read_int(GRAPHICS["i_last_time"]) / 1000.0
-            i_best_time = graphics.read_int(GRAPHICS["i_best_time"]) / 1000.0
-            delta = i_last_time - i_best_time if i_best_time > 0 else 0.0
-            air_temp = graphics.read_float(GRAPHICS["air_temp"])
-            road_temp = graphics.read_float(GRAPHICS["road_temp"])
-            rain = graphics.read_float(GRAPHICS["rain_intensity"])
-            flag = graphics.read_int(GRAPHICS["flag"])
-            in_pit = graphics.read_int(GRAPHICS["is_in_pit"])
-            
-            # Traduzir flag
-            flag_names = {0: "None", 1: "Blue", 2: "Yellow", 3: "Black", 
-                         4: "White", 5: "Checkered", 6: "Penalty"}
-            flag_name = flag_names.get(flag, f"Unknown({flag})")
-
-            # Realtime plot
-            gas_buf.append(gas)
-            brake_buf.append(brake)
-            x = np.arange(len(gas_buf))
-            line_gas.set_data(x, gas_buf)
-            line_brake.set_data(x, brake_buf)
-            fig.canvas.draw_idle()
-            fig.canvas.flush_events()
-
-            # Lap detection
-            if lap != last_lap and last_lap > 0:
-                minutes = int(i_last_time // 60)
-                seconds = i_last_time % 60
-                delta_sign = "+" if delta > 0 else ""
-                print(f"\n🏁 Volta {last_lap} completa")
-                print(f"   ⏱️  Tempo: {minutes}:{seconds:06.3f}")
-                if i_best_time > 0:
-                    print(f"   🏆 Delta: {delta_sign}{delta:.3f}s")
-                print(f"   📢 Posição: P{position}")
-                last_lap = lap
-            elif lap != last_lap:
-                last_lap = lap
-                print(f"\n🔄 Iniciando Volta {lap} | P{position}")
-
-            # Save data
-            save_row([
-                t, lap, position, i_last_time, i_best_time, delta,
-                gas, brake, rpm, speed, gear, steer, fuel,
-                tc_on, abs_on,
-                tyre_press[0], tyre_press[1], tyre_press[2], tyre_press[3],
-                tyre_temp[0], tyre_temp[1], tyre_temp[2], tyre_temp[3],
-                air_temp, road_temp, rain,
-                flag_name, in_pit
-            ])
-
-            time.sleep(0.03)
-
-    except KeyboardInterrupt:
-        print("\n🛑 Sessão encerrada")
+# ======================================================
+# 4. LEITOR DE MEMÓRIA (BACKEND)
+# ======================================================
+class ACCReader:
+    def __init__(self, data_store):
+        self.data = data_store
+        self.running = False
+        self.thread = None
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel32.OpenFileMappingW.restype = ctypes.c_void_p
+        self.kernel32.MapViewOfFile.restype = ctypes.c_void_p
+        self.kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+        self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         
-        # Fechar janela realtime
-        plt.ioff()
-        plt.close(fig)
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+    def _loop(self):
+        h_phys = None
+        h_graph = None
+
+        while self.running:
+            try:
+                if not h_phys or not h_graph:
+                    h_phys = self.kernel32.OpenFileMappingW(FILE_MAP_READ, False, "Local\\acpmf_physics")
+                    h_graph = self.kernel32.OpenFileMappingW(FILE_MAP_READ, False, "Local\\acpmf_graphics")
+                    
+                    if h_phys and h_graph:
+                        self.data.status = "CONECTADO"
+                        self.data.connected = True
+                    else:
+                        self.data.status = "AGUARDANDO SIMULADOR..."
+                        self.data.connected = False
+                        time.sleep(1)
+                        continue
+
+                # --- LEITURA PHYSICS ---
+                v_phys = self.kernel32.MapViewOfFile(h_phys, FILE_MAP_READ, 0, 0, ctypes.sizeof(SPageFilePhysics))
+                if v_phys:
+                    p = SPageFilePhysics.from_address(v_phys)
+                    
+                    self.data.gear = GEAR_MAP.get(p.gear, "?")
+                    self.data.rpm = p.rpm
+                    self.data.speed = int(p.speedKmh)
+                    self.data.gas = p.gas
+                    self.data.brake = p.brake
+                    self.data.fuel = p.fuel
+                    self.data.brake_bias = p.brakeBias
+                    
+                    # Leitura de Pneus (Temp + Pressão)
+                    self.data.tyre_core_temp = [p.tyreCoreTemp[0], p.tyreCoreTemp[1], p.tyreCoreTemp[2], p.tyreCoreTemp[3]]
+                    self.data.tyre_pressure = [p.wheelPressure[0], p.wheelPressure[1], p.wheelPressure[2], p.wheelPressure[3]]
+                    
+                    self.kernel32.UnmapViewOfFile(v_phys)
+
+                # --- LEITURA GRAPHICS ---
+                v_graph = self.kernel32.MapViewOfFile(h_graph, FILE_MAP_READ, 0, 0, ctypes.sizeof(Graphics))
+                if v_graph:
+                    g = Graphics.from_address(v_graph)
+                    self.data.tc1 = g.TC
+                    self.data.tc2 = g.TCCut
+                    self.data.abs_val = g.ABS
+                    self.data.engine_map = g.EngineMap + 1
+                    self.kernel32.UnmapViewOfFile(v_graph)
+
+            except Exception as e:
+                print(f"Erro: {e}")
+                self.data.status = "ERRO LEITURA"
+                if h_phys: self.kernel32.CloseHandle(h_phys)
+                if h_graph: self.kernel32.CloseHandle(h_graph)
+                h_phys, h_graph = None, None
+            
+            time.sleep(0.016)
+
+# ======================================================
+# 5. INTERFACE GRÁFICA (FRONTEND)
+# ======================================================
+class DashboardApp(tk.Tk):
+    def __init__(self, data_store):
+        super().__init__()
+        self.data = data_store
         
-        # Gerar PDF
-        generate_pdf()
+        self.title("ACC Dashboard Pro")
+        self.geometry("400x680") # Aumentei um pouco a altura para caber melhor
+        self.configure(bg="#121212")
+        self.resizable(False, False)
 
-# ==========================
-# PDF GENERATION
-# ==========================
+        self._init_ui()
+        self._update_loop()
 
-def generate_pdf():
-    print("📄 Gerando PDF da sessão...")
-
-    # Backend sem GUI
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    try:
-        data = np.genfromtxt(CSV_FILE, delimiter=",", skip_header=1, encoding='utf-8')
-    except:
-        data = np.genfromtxt(CSV_FILE, delimiter=",", skip_header=1)
-
-    if data.size == 0:
-        print("⚠️ Nenhum dado capturado para gerar PDF")
-        return
-
-    # Estrutura do CSV: 
-    # [0]=time, [1]=lap, [2]=position, [3]=lap_time, [4]=best_time, [5]=delta,
-    # [6]=gas, [7]=brake, [8]=rpm, [9]=speed, [10]=gear, [11]=steer, [12]=fuel,
-    # [13]=tc_on, [14]=abs_on,
-    # [15]=tyre_press_fl, [16]=fr, [17]=rl, [18]=rr,
-    # [19]=tyre_temp_fl, [20]=fr, [21]=rl, [22]=rr,
-    # [23]=air_temp, [24]=road_temp, [25]=rain, [26]=flag, [27]=in_pit
-    
-    time_axis = data[:, 0]
-    lap_data = data[:, 1].astype(int)
-
-    with PdfPages(PDF_FILE) as pdf:
-        # Página 1: Resumo de Voltas
-        unique_laps = np.unique(lap_data)
-        if len(unique_laps) > 1:
-            fig_laps, ax = plt.subplots(figsize=(10, 6))
-            
-            lap_times = []
-            lap_numbers = []
-            
-            for lap_num in unique_laps:
-                if lap_num > 0:
-                    mask = lap_data == lap_num
-                    lap_times_in_lap = data[mask, 3]  # [3] = lap_time
-                    if len(lap_times_in_lap) > 0:
-                        final_time = lap_times_in_lap[-1]
-                        if final_time > 0:
-                            lap_numbers.append(int(lap_num))
-                            lap_times.append(final_time)
-            
-            if lap_times:
-                ax.bar(lap_numbers, lap_times, color='#00aa00', alpha=0.7, edgecolor='black')
-                ax.set_title('⏱️ Tempos de Volta', fontsize=16, fontweight='bold')
-                ax.set_xlabel('Número da Volta', fontsize=12)
-                ax.set_ylabel('Tempo (s)', fontsize=12)
-                ax.grid(True, alpha=0.3)
-                
-                # Valores nas barras
-                for lap_num, lap_time in zip(lap_numbers, lap_times):
-                    minutes = int(lap_time // 60)
-                    seconds = lap_time % 60
-                    ax.text(lap_num, lap_time, f"{minutes}:{seconds:06.3f}", 
-                           ha='center', va='bottom', fontsize=9, fontweight='bold')
-                
-                # Melhor volta
-                best_idx = np.argmin(lap_times)
-                best_lap = lap_numbers[best_idx]
-                best_time = lap_times[best_idx]
-                minutes = int(best_time // 60)
-                seconds = best_time % 60
-                ax.axhline(y=best_time, color='red', linestyle='--', linewidth=2,
-                          label=f'Melhor: Volta {best_lap} ({minutes}:{seconds:06.3f})')
-                ax.legend(fontsize=11)
-            
-            plt.tight_layout()
-            pdf.savefig(fig_laps)
-            plt.close(fig_laps)
-
-        # Páginas seguintes: Gráficos de telemetria
-        plots = [
-            ("🔄 RPM", data[:, 8]),
-            ("⚙️ Marcha", data[:, 10]),
-            ("🎮 Ângulo do Volante", data[:, 11]),
-            ("🚗 Acelerador", data[:, 6]),
-            ("🛑 Freio", data[:, 7]),
-            ("💨 Velocidade (km/h)", data[:, 9]),
-            ("⛽ Combustível (L)", data[:, 12]),
-            ("🌡️ Temperatura do Ar (°C)", data[:, 23]),
-            ("🛣️ Temperatura da Pista (°C)", data[:, 24]),
-        ]
-
-        for title, series in plots:
-            fig_p, ax = plt.subplots(figsize=(12, 5))
-            ax.plot(time_axis, series, linewidth=1.5, color='#0066cc')
-            ax.set_title(title, fontsize=14, fontweight='bold')
-            ax.set_xlabel("Tempo (s)", fontsize=11)
-            ax.set_ylabel(title.split(' ', 1)[1] if ' ' in title else title, fontsize=11)
-            ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            pdf.savefig(fig_p)
-            plt.close(fig_p)
+    def _init_ui(self):
+        style_bg = "#121212"
         
-        # Gráfico de pressão dos pneus (todas as 4 rodas)
-        fig_press, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(time_axis, data[:, 15], label='FL', linewidth=1.5, color='red')
-        ax.plot(time_axis, data[:, 16], label='FR', linewidth=1.5, color='orange')
-        ax.plot(time_axis, data[:, 17], label='RL', linewidth=1.5, color='blue')
-        ax.plot(time_axis, data[:, 18], label='RR', linewidth=1.5, color='cyan')
-        ax.set_title('🔧 Pressão dos Pneus (PSI)', fontsize=14, fontweight='bold')
-        ax.set_xlabel("Tempo (s)", fontsize=11)
-        ax.set_ylabel("PSI", fontsize=11)
-        ax.legend(loc='best')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        pdf.savefig(fig_press)
-        plt.close(fig_press)
+        self.lbl_status = tk.Label(self, text="...", font=("Segoe UI", 9), bg=style_bg, fg="#888")
+        self.lbl_status.pack(pady=5)
+
+        # 1. Gear e Speed
+        frame_top = tk.Frame(self, bg=style_bg)
+        frame_top.pack(pady=5)
         
-        # Gráfico de temperatura dos pneus
-        fig_temp, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(time_axis, data[:, 19], label='FL', linewidth=1.5, color='red')
-        ax.plot(time_axis, data[:, 20], label='FR', linewidth=1.5, color='orange')
-        ax.plot(time_axis, data[:, 21], label='RL', linewidth=1.5, color='blue')
-        ax.plot(time_axis, data[:, 22], label='RR', linewidth=1.5, color='cyan')
-        ax.set_title('🌡️ Temperatura dos Pneus (°C)', fontsize=14, fontweight='bold')
-        ax.set_xlabel("Tempo (s)", fontsize=11)
-        ax.set_ylabel("°C", fontsize=11)
-        ax.legend(loc='best')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        pdf.savefig(fig_temp)
-        plt.close(fig_temp)
+        self.lbl_gear = tk.Label(frame_top, text="N", font=("Verdana", 60, "bold"), bg=style_bg, fg="#FFD700")
+        self.lbl_gear.grid(row=0, column=0, padx=20)
+        
+        self.lbl_speed = tk.Label(frame_top, text="0", font=("Verdana", 60, "bold"), bg=style_bg, fg="#00E5FF")
+        self.lbl_speed.grid(row=0, column=1, padx=20)
 
-    num_laps = len([l for l in unique_laps if l > 0]) if len(unique_laps) > 1 else 0
-    print(f"✅ PDF gerado com {num_laps} volta(s): {PDF_FILE}")
+        # 2. RPM e PEDAIS
+        frame_inputs = tk.Frame(self, bg="#1E1E1E", bd=1, relief="solid")
+        frame_inputs.pack(fill="x", padx=15, pady=5)
 
-# ==========================
-# ENTRY POINT
-# ==========================
+        # RPM
+        tk.Label(frame_inputs, text="RPM", font=("Segoe UI", 8, "bold"), bg="#1E1E1E", fg="#AAA").pack(anchor="w", padx=5)
+        self.cv_rpm = tk.Canvas(frame_inputs, width=350, height=20, bg="#252525", highlightthickness=0)
+        self.cv_rpm.pack(pady=(0, 10))
 
+        # Pedais
+        frame_pedals = tk.Frame(frame_inputs, bg="#1E1E1E")
+        frame_pedals.pack(fill="x", padx=5, pady=5)
+
+        # Gas
+        f_gas = tk.Frame(frame_pedals, bg="#1E1E1E")
+        f_gas.pack(side="left", expand=True, fill="x")
+        tk.Label(f_gas, text="ACEL", font=("Segoe UI", 7), bg="#1E1E1E", fg="#44FF44").pack(anchor="w")
+        self.cv_gas = tk.Canvas(f_gas, width=160, height=15, bg="#252525", highlightthickness=0)
+        self.cv_gas.pack()
+
+        # Brake
+        f_brake = tk.Frame(frame_pedals, bg="#1E1E1E")
+        f_brake.pack(side="right", expand=True, fill="x")
+        tk.Label(f_brake, text="TRAVÃO", font=("Segoe UI", 7), bg="#1E1E1E", fg="#FF4444").pack(anchor="e")
+        self.cv_brake = tk.Canvas(f_brake, width=160, height=15, bg="#252525", highlightthickness=0)
+        self.cv_brake.pack()
+
+        # 3. Brake Bias
+        frame_bb = tk.Frame(self, bg="#1E1E1E", bd=1, relief="solid")
+        frame_bb.pack(fill="x", padx=15, pady=10)
+        
+        tk.Label(frame_bb, text="BRAKE BIAS", font=("Segoe UI", 8), bg="#1E1E1E", fg="#AAA").pack(pady=(5,0))
+        self.lbl_bb_val = tk.Label(frame_bb, text="--.-%", font=("Consolas", 24, "bold"), bg="#1E1E1E", fg="#FF00FF")
+        self.lbl_bb_val.pack()
+
+        self.cv_bb = tk.Canvas(frame_bb, width=350, height=10, bg="#252525", highlightthickness=0)
+        self.cv_bb.pack(pady=10)
+
+        # 4. Pneus (Agora com Pressão)
+        frame_tyres = tk.Frame(self, bg="#121212")
+        frame_tyres.pack(pady=5)
+        
+        self.tyre_temp_labels = [] # Lista para labels de temperatura
+        self.tyre_pres_labels = [] # Lista para labels de pressão
+        
+        pos = [(0,0), (0,1), (1,0), (1,1)]
+        # Layout: FL, FR, RL, RR
+        for i, (r, c) in enumerate(pos):
+            # Aumentei altura de 45 para 55 para caber a pressão
+            f = tk.Frame(frame_tyres, bg="#222", width=70, height=55) 
+            f.grid(row=r, column=c, padx=5, pady=5)
+            f.pack_propagate(False)
+            
+            # Label Temperatura (Topo)
+            l_temp = tk.Label(f, text="--°", font=("Segoe UI", 12, "bold"), bg="#222", fg="white")
+            l_temp.pack(pady=(5,0))
+            self.tyre_temp_labels.append(l_temp)
+            
+            # Label Pressão (Baixo) - Fonte menor, cor Ciano
+            l_pres = tk.Label(f, text="-- psi", font=("Segoe UI", 9), bg="#222", fg="#00E5FF")
+            l_pres.pack()
+            self.tyre_pres_labels.append(l_pres)
+
+        # 5. Eletrônica
+        frame_elec = tk.Frame(self, bg="#1E1E1E")
+        frame_elec.pack(fill="x", padx=15, pady=10)
+        self.lbl_tc1 = self._create_elec_box(frame_elec, "TC1", 0)
+        self.lbl_tc2 = self._create_elec_box(frame_elec, "TC2", 1)
+        self.lbl_abs = self._create_elec_box(frame_elec, "ABS", 2)
+        self.lbl_map = self._create_elec_box(frame_elec, "MAP", 3)
+
+    def _create_elec_box(self, parent, title, col):
+        f = tk.Frame(parent, bg="#1E1E1E")
+        f.grid(row=0, column=col, padx=12, pady=5)
+        tk.Label(f, text=title, font=("Segoe UI", 8), bg="#1E1E1E", fg="#AAA").pack()
+        l = tk.Label(f, text="-", font=("Consolas", 14, "bold"), bg="#1E1E1E", fg="white")
+        l.pack()
+        return l
+
+    def _update_loop(self):
+        status_color = "#44FF44" if self.data.connected else "#FF4444"
+        self.lbl_status.config(text=self.data.status, fg=status_color)
+
+        if self.data.connected:
+            self.lbl_gear.config(text=self.data.gear)
+            self.lbl_speed.config(text=str(self.data.speed))
+            
+            # Gráficos
+            self._draw_rpm(self.data.rpm)
+            self._draw_pedals(self.data.gas, self.data.brake)
+
+            # Electronics
+            self.lbl_tc1.config(text=str(self.data.tc1), fg="#44FF44" if self.data.tc1 > 0 else "#555")
+            self.lbl_tc2.config(text=str(self.data.tc2), fg="#44FF44" if self.data.tc2 > 0 else "#555")
+            self.lbl_abs.config(text=str(self.data.abs_val), fg="#FFAA00" if self.data.abs_val > 0 else "#555")
+            self.lbl_map.config(text=str(self.data.engine_map), fg="#00E5FF")
+
+            # Brake Bias
+            bb = self.data.brake_bias * 100
+            self.lbl_bb_val.config(text=f"{bb:.1f}%")
+            self._draw_bb_bar(bb)
+
+            # --- Pneus: Temperatura ---
+            if self.data.tyre_core_temp:
+                for i, temp in enumerate(self.data.tyre_core_temp):
+                    color = "#00FFFF"
+                    if temp > 70: color = "#44FF44"
+                    if temp > 100: color = "#FF4444"
+                    self.tyre_temp_labels[i].config(text=f"{temp:.0f}°", fg=color)
+            
+            # --- Pneus: Pressão (Novo) ---
+            if self.data.tyre_pressure:
+                for i, press in enumerate(self.data.tyre_pressure):
+                    # ACC entrega PSI nativo na SharedMemory
+                    self.tyre_pres_labels[i].config(text=f"{press:.1f} psi")
+
+        self.after(20, self._update_loop)
+
+    def _draw_rpm(self, rpm):
+        self.cv_rpm.delete("all")
+        width = 350
+        pct = min(1.0, rpm / MAX_RPM_GT3)
+        w_bar = width * pct
+        
+        # Cores RPM
+        if pct < 0.70:
+            color = "#22FF22"
+        elif pct < 0.84:
+            color = "#FFFF00"
+        else:
+            color = "#FF2222"
+            if pct > 0.98 and int(time.time() * 10) % 2 == 0:
+                color = "#FFFFFF"
+
+        self.cv_rpm.create_rectangle(0, 0, w_bar, 20, fill=color, outline="")
+
+        txt = f"{rpm} RPM"
+        cx, cy = width / 2, 10
+        self.cv_rpm.create_text(cx+1, cy+1, text=txt, fill="black", font=("Segoe UI", 9, "bold"))
+        self.cv_rpm.create_text(cx, cy, text=txt, fill="white", font=("Segoe UI", 9, "bold"))
+
+    def _draw_pedals(self, gas, brake):
+        self.cv_gas.delete("bar")
+        w_gas = 160 * gas
+        self.cv_gas.create_rectangle(0, 0, w_gas, 15, fill="#44FF44", outline="", tags="bar")
+
+        self.cv_brake.delete("bar")
+        w_brake = 160 * brake
+        self.cv_brake.create_rectangle(0, 0, w_brake, 15, fill="#FF4444", outline="", tags="bar")
+
+    def _draw_bb_bar(self, bb):
+        self.cv_bb.delete("bar")
+        width = 350
+        if bb < 10 or bb > 90: return
+        ratio = (bb - 48.0) / 20.0 
+        ratio = max(0, min(1, ratio))
+        x_pos = ratio * width
+        self.cv_bb.create_rectangle(0, 0, width, 10, fill="#333", outline="") 
+        self.cv_bb.create_rectangle(x_pos-2, 0, x_pos+2, 10, fill="#DDAA00", tags="bar", outline="white")
+
+# ======================================================
+# 6. EXECUÇÃO PRINCIPAL
+# ======================================================
 if __name__ == "__main__":
-    main()
+    telemetry_state = TelemetryData()
+    reader = ACCReader(telemetry_state)
+    reader.start()
+    
+    try:
+        app = DashboardApp(telemetry_state)
+        app.mainloop()
+    finally:
+        reader.stop()
